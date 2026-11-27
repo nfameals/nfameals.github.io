@@ -1,1 +1,6 @@
-{"open":true,"v":3}
+{
+ "open": true,
+ "closedMsg": "Orders are paused for now. Please check back soon.",
+ "soldOut": [],
+ "updated": "2026-11-27T00:00:00.000Z"
+}

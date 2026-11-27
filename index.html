@@ -25,6 +25,11 @@ h3{font-size:15px;margin:16px 0 8px}
 .banner.open{background:#dcfce7;color:var(--ok);border-color:#bbf7d0}
 .banner strong{display:block;font-size:16px}
 .banner span{font-size:14px}
+.banner .livenote{display:block;margin-top:6px;font-size:12px;opacity:.85}
+.publine{margin-top:10px;padding:10px 12px;border-radius:10px;font-size:14px;background:#f5f5f4;color:var(--muted)}
+.publine.ok{background:#dcfce7;color:var(--ok)}
+.publine.bad{background:#fee2e2;color:var(--warn)}
+.publine.busy{background:#fef9c3;color:#854d0e}
 .packs{display:grid;gap:12px}
 .pack{background:var(--card);border:1px solid var(--line);border-radius:16px;overflow:hidden;display:grid;grid-template-columns:140px 1fr;position:relative}
 .pack .ph{background:#fde7d3;min-height:140px}
@@ -176,7 +181,7 @@ pre.rtext{white-space:pre-wrap;background:#fafaf9;border-radius:12px;padding:12p
     </ol>
   </section>
 
-  <div id="banner" class="banner"><strong id="bTitle"></strong><span id="bSub"></span></div>
+  <div id="banner" class="banner"><strong id="bTitle"></strong><span id="bSub"></span><span id="bLive" class="livenote" hidden></span></div>
 
   <div id="menuView">
     <h2>1. Choose your meals</h2>
@@ -267,7 +272,7 @@ pre.rtext{white-space:pre-wrap;background:#fafaf9;border-radius:12px;padding:12p
     </header>
     <a href="#">View shop ›</a>
   </div>
-  <p class="hint" style="margin-bottom:12px">Everything here saves on this device only. Customers get your open/closed state and sold-out meals through the Short Customer Link (section 2). Other changes reach customers when you copy them to GitHub (section 3).</p>
+  <p class="hint" style="margin-bottom:12px">Open/closed, the closed notice and sold-out meals go live to customers automatically (within about 1 minute) once your live status key is set up below. Other changes save on this device only and reach customers when you copy them to GitHub (section 3).</p>
 
   <!-- 1 -->
   <section class="card">
@@ -280,24 +285,31 @@ pre.rtext{white-space:pre-wrap;background:#fafaf9;border-radius:12px;padding:12p
     <p class="hint" id="scheduleLine"></p>
     <label for="f_closedMsg">Closed notice message</label>
     <input id="f_closedMsg" data-field="closedMsg" maxlength="140">
+    <div id="pubLine" class="publine" role="status"></div>
+    <button class="btn btn-sec btn-sm" type="button" data-act="publishNow" style="margin-top:8px">Publish status now</button>
+    <details id="keyBox" style="margin-top:12px">
+      <summary><strong>Live status key</strong> <span class="pill" id="keyPill"></span></summary>
+      <p class="hint">This key lets this phone update your shop's status on GitHub. It stays on this phone only and is never included in "Copy settings for GitHub". Create it on GitHub (Settings → Developer settings → Fine-grained tokens), for the <strong>nfameals.github.io</strong> repository only, with <strong>Contents: Read and write</strong>.</p>
+      <label for="ghKey">Paste key</label>
+      <input id="ghKey" type="password" autocomplete="off" spellcheck="false" placeholder="github_pat_...">
+      <div class="two" style="margin-top:8px">
+        <button class="btn btn-main btn-sm" type="button" data-act="saveKey">Save &amp; test key</button>
+        <button class="btn btn-sec btn-sm" type="button" data-act="removeKey">Remove key</button>
+      </div>
+    </details>
   </section>
 
   <!-- 2 -->
   <section class="card">
     <h2>2. Shareable links</h2>
     <div class="linkbox">
-      <div class="lbl">Short customer order link <span class="pill" id="codeLen"></span></div>
-      <code class="url" id="lnkShort"></code>
+      <div class="lbl">Your shop link</div>
+      <code class="url" id="lnkClean"></code>
       <div class="two">
-        <button class="btn btn-main btn-sm" type="button" data-act="copyShort">Copy Link</button>
+        <button class="btn btn-main btn-sm" type="button" data-act="copyClean">Copy Link</button>
         <a class="btn btn-ok btn-sm" id="waShort" href="#" target="_blank" rel="noopener">WhatsApp</a>
       </div>
-      <p class="hint">Share this link again after you open or close the store, or mark a meal sold out.</p>
-    </div>
-    <div class="linkbox">
-      <div class="lbl">Clean direct link</div>
-      <code class="url" id="lnkClean"></code>
-      <button class="btn btn-sec btn-sm" type="button" data-act="copyClean">Copy Clean URL</button>
+      <p class="hint">One link for good. It always shows your latest open/closed and sold-out status, so you only need to share it once. Old links people saved still work.</p>
     </div>
     <div class="linkbox">
       <div class="lbl">Seller admin link</div>
@@ -394,6 +406,21 @@ const MAX_PAX = 5;
 const PICKUP_PLACE = "Library UMS", PICKUP_TIME = "12:00 PM";
 const CUTOFF = "09:30", REOPEN = "12:00";
 const K_SET = "nfa.settings.v1", K_ORD = "nfa.orders.v1";
+/* Live status key: stored on its own, never inside settings, so "Copy settings for GitHub" can't leak it. */
+const K_KEY = "nfa.ghkey.v1", K_PUB = "nfa.lastpub.v1";
+const REPO = (function () {
+  try {
+    const h = location.hostname.toLowerCase();
+    if (/^[a-z0-9-]+\.github\.io$/.test(h)) {
+      const owner = h.split(".")[0];
+      const seg = location.pathname.split("/").filter(Boolean)[0];
+      return { owner, name: seg && !/\.html$/i.test(seg) ? seg : h };
+    }
+  } catch (e) { /* fall back */ }
+  return { owner: "nfameals", name: "nfameals.github.io" };
+})();
+const STATUS_URL = "status.json";
+const LIVE_POLL_MS = 60000;
 const STATUSES = ["Payment Submitted", "Verified Paid", "Collected", "Cancelled"];
 const DEFAULT_MENU = [
   { id: "basic", name: "Basic", price: 10, desc: "Nasi putih, ayam goreng, sayur campur", photo: "basic.jpg", available: true },
@@ -468,8 +495,8 @@ function getMode(V) {
   if (weekday && mins < re) return { m: "closed", nextText: `Orders for ${fmtDate(nextWeekday(today))} open at ${fmtMin(re)} today.` };
   const day = nextWeekday(today);
   const tm = new Date(today); tm.setUTCDate(tm.getUTCDate() + 1);
-  const word = day.getTime() === tm.getTime() ? "Tomorrow" : WD[day.getUTCDay()];
-  return { m: "next", label: `${word}, ${fmtDate(day)}, ${PICKUP_TIME}`, closesAt: `${fmtMin(cut)} on ${fmtDate(day)}` };
+  const word = day.getTime() === tm.getTime() ? "Tomorrow, " : "";
+  return { m: "next", label: `${word}${fmtDate(day)}, ${PICKUP_TIME}`, closesAt: `${fmtMin(cut)} on ${fmtDate(day)}` };
 }
 const isOpenMode = M => M.m === "today" || M.m === "next";
 
@@ -585,11 +612,42 @@ function compressImage(file, max, quality) {
 /* ================= CUSTOMER ================= */
 let V = S, MODE = { m: "closed" }, qty = {}, CUR_REF = newRef();
 
+/* ---------- live status (status.json in the repo) ---------- */
+let LIVE = null, LIVE_STATE = "pending", LIVE_AT = 0;
+function cleanLive(j) {
+  if (!j || typeof j !== "object" || typeof j.open !== "boolean") return null;
+  return { open: j.open, closedMsg: typeof j.closedMsg === "string" ? j.closedMsg.slice(0, 140) : "",
+    soldOut: Array.isArray(j.soldOut) ? j.soldOut.map(String).slice(0, 50) : [], updated: String(j.updated || "") };
+}
+async function fetchLive(timeoutMs) {
+  const ctl = typeof AbortController === "function" ? new AbortController() : null;
+  const timer = ctl ? setTimeout(() => ctl.abort(), timeoutMs || 8000) : 0;
+  try {
+    const r = await fetch(STATUS_URL + "?t=" + Date.now(), { cache: "no-store", signal: ctl ? ctl.signal : undefined });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const j = cleanLive(await r.json());
+    if (!j) throw new Error("bad status file");
+    LIVE = j; LIVE_STATE = "ok"; LIVE_AT = Date.now();
+  } catch (e) { LIVE_STATE = LIVE ? "stale" : "failed"; }
+  finally { clearTimeout(timer); }
+  return LIVE_STATE;
+}
 function viewSettings() {
   const v = clone(S);
   const o = parseO(location.hash);
   if (o) { v.open = o.open; v.wa = o.wa; v.menu.forEach((it, i) => { it.available = !(o.mask & (1 << i)); }); }
+  /* Live status always wins over anything in an old #o= link. */
+  if (LIVE) {
+    v.open = LIVE.open;
+    if (LIVE.closedMsg) v.closedMsg = LIVE.closedMsg;
+    v.menu.forEach(it => { it.available = !LIVE.soldOut.includes(it.id); });
+  }
   return v;
+}
+async function refreshLive() {
+  await fetchLive();
+  if (!$("customerView").hidden && $("confirm").hidden) renderCustomer();
+  else if (!$("adminView").hidden) renderPubLine();
 }
 function cTotals() {
   let pax = 0, sub = 0;
@@ -635,6 +693,9 @@ function renderBanner() {
   else if (MODE.m === "paused") { $("bTitle").textContent = "Orders are closed right now"; $("bSub").textContent = V.closedMsg; }
   else { $("bTitle").textContent = `Today's orders closed at ${fmtMin(toMin(CUTOFF))}`; $("bSub").textContent = MODE.nextText; }
   $("pickupLine").textContent = `${PICKUP_PLACE}, ${MODE.label || PICKUP_TIME}`;
+  const ln = $("bLive");
+  ln.hidden = LIVE_STATE === "ok" || LIVE_STATE === "pending";
+  ln.textContent = "Couldn't check the latest shop status. Check your internet; this page will retry automatically.";
 }
 function renderQrBank() {
   const box = $("qrBox");
@@ -692,9 +753,24 @@ $("copyAmt").addEventListener("click", () => copy(cTotals().total.toFixed(2), "A
 $("copyAcct").addEventListener("click", () => copy(String(V.bank.acct || "").replace(/\s/g, ""), "Account number copied"));
 $("qrBox").addEventListener("click", () => { if (V.qr && $("qrBox").querySelector("img")) $("qrFull").hidden = false; });
 $("qrClose").addEventListener("click", () => { $("qrFull").hidden = true; });
-$("waBtn").addEventListener("click", e => {
+let waChecking = false;
+$("waBtn").addEventListener("click", async e => {
+  e.preventDefault();
+  if (waChecking || !cReady(cTotals())) return;
+  /* Re-check the live status right before sending, in case the shop closed while this page was open. */
+  waChecking = true; const wa = $("waBtn"), label = wa.textContent; wa.textContent = "Checking shop status…";
+  await fetchLive(5000);
+  waChecking = false; wa.textContent = label;
+  renderCustomer();
   const t = cTotals();
-  if (!cReady(t)) { e.preventDefault(); return; }
+  if (!cReady(t)) {
+    toast(!isOpenMode(MODE) ? "Sorry, orders just closed." : "Your order changed (a meal sold out). Please check and try again.");
+    $("packs").scrollIntoView({ behavior: "smooth", block: "start" });
+    return;
+  }
+  const waUrl = "https://wa.me/" + V.wa + "?text=" + encodeURIComponent(waMessage(t));
+  let w = null; try { w = window.open(waUrl, "_blank", "noopener"); } catch (err) { w = null; }
+  if (!w) setTimeout(() => { window.location.href = waUrl; }, 120);
   $("cRef").textContent = CUR_REF;
   $("confirmPickup").textContent = `${PICKUP_PLACE}, ${MODE.label}`;
   $("confirmSummary").innerHTML = `
@@ -759,16 +835,71 @@ function renderStatus() {
   $("scheduleLine").textContent = M.m === "paused" ? "Customers see your closed notice and can't order."
     : M.m === "closed" ? `Cooking break now. ${M.nextText}` : `Right now customers are ordering for ${M.label}.`;
   setVal("f_closedMsg", S.closedMsg);
+  renderPubLine();
 }
 function renderLinks() {
-  const code = shortCode();
-  const short = BASE_URL + "#o=" + code;
-  $("lnkShort").textContent = short;
-  $("codeLen").textContent = code.length + " chars";
   $("lnkClean").textContent = BASE_URL;
   $("lnkAdmin").textContent = BASE_URL + "#setup";
-  $("waShort").href = "https://wa.me/?text=" + encodeURIComponent(`Order lunch from ${S.biz} (Library UMS, 12:00 PM pickup): ${short}`);
+  $("waShort").href = "https://wa.me/?text=" + encodeURIComponent(`Order lunch from ${S.biz} (Library UMS, 12:00 PM pickup): ${BASE_URL}`);
 }
+
+/* ---------- publishing live status (admin) ---------- */
+const getKey = () => { try { return localStorage.getItem(K_KEY) || ""; } catch (e) { return ""; } };
+const liveFromS = () => ({ open: S.open, closedMsg: S.closedMsg, soldOut: S.menu.filter(it => !it.available).map(it => it.id), updated: new Date().toISOString() });
+let PUB = { state: "idle", msg: "" }, pubSeq = 0, pubTimer;
+function setPub(state, msg) { PUB = { state, msg }; renderPubLine(); }
+function renderPubLine() {
+  const el = $("pubLine"); if (!el) return;
+  const key = getKey();
+  $("keyPill").textContent = key ? "Set" : "Not set";
+  if (!key) { el.className = "publine bad"; el.textContent = "⚠️ Live status key not set up yet, so customers don't see changes here. Open \"Live status key\" below."; $("keyBox").open = true; return; }
+  if (PUB.state !== "idle") { el.className = "publine " + PUB.state; el.textContent = PUB.msg; return; }
+  const v = LIVE;
+  if (!v) { el.className = "publine"; el.textContent = "Checking what customers see…"; return; }
+  const same = v.open === S.open && JSON.stringify(v.soldOut.slice().sort()) === JSON.stringify(liveFromS().soldOut.sort()) && (v.closedMsg || "") === (S.closedMsg || "");
+  el.className = "publine " + (same ? "ok" : "bad");
+  el.textContent = (same ? "✅ Customers see: " : "⚠️ Customers still see: ") + (v.open ? "OPEN" : "CLOSED") +
+    (v.soldOut.length ? ` • sold out: ${v.soldOut.map(id => (S.menu.find(it => it.id === id) || { name: id }).name).join(", ")}` : "") +
+    (same ? "" : ". Tap \"Publish status now\" (changes take about 1 minute to appear).");
+}
+function ghHeaders(key) { return { "Authorization": "Bearer " + key, "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" }; }
+const ghUrl = () => `https://api.github.com/repos/${REPO.owner}/${REPO.name}/contents/${STATUS_URL}`;
+function b64utf8(str) { const bytes = new TextEncoder().encode(str); let s = ""; bytes.forEach(b => { s += String.fromCharCode(b); }); return btoa(s); }
+function ghError(status) {
+  return status === 401 ? "the key is wrong or has expired. Create a new key and paste it again."
+    : status === 403 || status === 404 ? "the key can't write to this shop. Make sure it's for the nfameals.github.io repository with Contents: Read and write."
+    : status === 0 ? "no internet connection. Try again when you have signal."
+    : "GitHub returned an error (" + status + "). Try again in a minute.";
+}
+async function publishStatus() {
+  const key = getKey(); if (!key) { renderPubLine(); return false; }
+  const seq = ++pubSeq;
+  setPub("busy", "⏳ Updating your shop for customers…");
+  const body = JSON.stringify(liveFromS(), null, 1) + "\n";
+  let lastStatus = 0;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const g = await fetch(ghUrl() + "?t=" + Date.now(), { headers: ghHeaders(key), cache: "no-store" });
+      lastStatus = g.status;
+      if (!g.ok && g.status !== 404) break;
+      const sha = g.ok ? (await g.json()).sha : undefined;
+      const p = await fetch(ghUrl(), { method: "PUT", headers: Object.assign({ "Content-Type": "application/json" }, ghHeaders(key)),
+        body: JSON.stringify({ message: `Shop status: ${S.open ? "OPEN" : "CLOSED"}`, content: b64utf8(body), sha }) });
+      lastStatus = p.status;
+      if (p.ok) {
+        if (seq !== pubSeq) return true;
+        LIVE = cleanLive(JSON.parse(body)); store.set(K_PUB, new Date().toISOString());
+        setPub("ok", `✅ Published: ${S.open ? "OPEN" : "CLOSED"}. Customers will see it within about 1 minute.`);
+        clearTimeout(pubTimer); pubTimer = setTimeout(() => { PUB = { state: "idle", msg: "" }; refreshLive(); }, 90000);
+        return true;
+      }
+      if (p.status !== 409 && p.status !== 422) break;
+    } catch (e) { lastStatus = 0; }
+  }
+  if (seq === pubSeq) setPub("bad", "❌ Not published: " + ghError(lastStatus) + " Customers still see the old status.");
+  return false;
+}
+function queuePublish() { clearTimeout(publishStatus._t); publishStatus._t = setTimeout(publishStatus, 400); }
 function renderSetup() {
   setVal("f_biz", S.biz); setVal("f_wa", S.wa); setVal("f_intro", S.intro); setVal("f_fee", S.fee); setVal("f_qr", /^data:/.test(S.qr) ? "" : S.qr);
   $("waPreview").textContent = validWA(S.wa) ? `Saved as ${prettyWA(S.wa)}` : "⚠️ This doesn't look like a Malaysian mobile number.";
@@ -1015,6 +1146,7 @@ $("adminView").addEventListener("input", e => {
 $("adminView").addEventListener("change", async e => {
   const el = e.target;
   if (el.dataset.field === "wa") { el.value = S.wa; }
+  if (el.dataset.field === "closedMsg") queuePublish();
   if (el.type !== "file" || !el.files || !el.files[0]) return;
   const file = el.files[0];
   try {
@@ -1034,10 +1166,19 @@ $("adminView").addEventListener("click", e => {
   const act = b.dataset.act, i = Number(b.dataset.i), id = b.dataset.id;
   const menuChanged = () => { saveSettings(); flashSaved("savedBadge2"); renderMenuBuilder(); renderLinks(); renderSales(); };
   switch (act) {
-    case "setOpen": S.open = true; saveSettings(); renderStatus(); renderLinks(); toast("Store OPEN — re-share your link"); break;
-    case "setClosed": S.open = false; saveSettings(); renderStatus(); renderLinks(); toast("Store CLOSED — re-share your link"); break;
-    case "copyShort": copy($("lnkShort").textContent, "Customer link copied"); break;
-    case "copyClean": copy(BASE_URL, "Clean URL copied"); break;
+    case "setOpen": S.open = true; saveSettings(); renderStatus(); publishStatus(); break;
+    case "setClosed": S.open = false; saveSettings(); renderStatus(); publishStatus(); break;
+    case "publishNow": publishStatus(); break;
+    case "saveKey": {
+      const k = $("ghKey").value.trim();
+      if (!/^(github_pat_|ghp_)[A-Za-z0-9_]{20,}$/.test(k)) { toast("That doesn't look like a GitHub key (it starts with github_pat_)"); break; }
+      try { localStorage.setItem(K_KEY, k); } catch (err) { toast("Couldn't save the key on this phone"); break; }
+      $("ghKey").value = ""; toast("Key saved. Testing…");
+      publishStatus().then(ok => { if (ok) { $("keyBox").open = false; toast("Key works!"); } });
+      break;
+    }
+    case "removeKey": confirmTap(b, "Remove key", () => { try { localStorage.removeItem(K_KEY); } catch (err) { /* ignore */ } PUB = { state: "idle", msg: "" }; renderPubLine(); toast("Key removed from this phone"); }); break;
+    case "copyClean": copy(BASE_URL, "Shop link copied"); break;
     case "copyAdmin": copy(BASE_URL + "#setup", "Admin URL copied"); break;
     case "removeQr": S.qr = ""; saveSettings(); flashSaved("savedBadge"); renderSetup(); break;
     case "export": {
@@ -1048,7 +1189,7 @@ $("adminView").addEventListener("click", e => {
     }
     case "up": if (i > 0) { [S.menu[i - 1], S.menu[i]] = [S.menu[i], S.menu[i - 1]]; menuChanged(); } break;
     case "down": if (i < S.menu.length - 1) { [S.menu[i + 1], S.menu[i]] = [S.menu[i], S.menu[i + 1]]; menuChanged(); } break;
-    case "toggleAvail": if (S.menu[i]) { S.menu[i].available = !S.menu[i].available; menuChanged(); toast("Updated — re-share your customer link"); } break;
+    case "toggleAvail": if (S.menu[i]) { S.menu[i].available = !S.menu[i].available; menuChanged(); publishStatus(); } break;
     case "delMeal": confirmTap(b, "Delete", () => { S.menu.splice(i, 1); menuChanged(); }); break;
     case "addMeal":
       if (S.menu.length >= 20) { toast("Maximum 20 meals"); break; }
@@ -1076,7 +1217,7 @@ function route() {
   $("receiptView").hidden = view !== "receipt";
   $("qrFull").hidden = true; closeModal();
   if (view !== "customer") $("sticky").hidden = true;
-  if (view === "admin") { document.title = "Seller Admin • " + S.biz; renderAdmin(); }
+  if (view === "admin") { document.title = "Seller Admin • " + S.biz; renderAdmin(); refreshLive(); }
   else if (view === "receipt") { document.title = "Official Receipt • " + S.biz; renderReceiptView(); }
   else renderCustomer();
   window.scrollTo(0, 0);
@@ -1091,7 +1232,12 @@ setInterval(() => {
   else if (!$("adminView").hidden) renderStatus();
 }, 30000);
 
+/* Customers: re-check the live status every minute while the page is visible, and whenever they come back to it. */
+setInterval(() => { if (document.visibilityState === "visible" && $("adminView").hidden && $("receiptView").hidden) refreshLive(); }, LIVE_POLL_MS);
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && Date.now() - LIVE_AT > 15000) refreshLive(); });
+
 route();
+if ($("adminView").hidden) refreshLive();
 })();
 </script>
 </body>
