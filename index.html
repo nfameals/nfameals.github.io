@@ -171,7 +171,7 @@ pre.rtext{white-space:pre-wrap;background:#fafaf9;border-radius:12px;padding:12p
     <ol>
       <li><strong>Order by 9:30 AM</strong> for 12:00 PM pickup the same day. Orders after 12:00 PM are for the next weekday.</li>
       <li><strong>Pick a package</strong> and how many pax you need (up to 5 per package).</li>
-      <li><strong>Pay</strong> by scanning the QR code or by bank transfer.</li>
+      <li><strong>Pay</strong> by scanning the QR code<span id="payBankNote" hidden> or by bank transfer</span>.</li>
       <li><strong>Collect</strong> your order at the library at 12:00 PM.</li>
     </ol>
   </section>
@@ -638,10 +638,12 @@ function renderBanner() {
 }
 function renderQrBank() {
   const box = $("qrBox");
-  if (V.qr) { box.innerHTML = `<img src="${esc(V.qr)}" alt="Payment QR code" onerror="this.parentNode.textContent='QR not available. Please pay by bank transfer or ask on WhatsApp.'">`; $("qrFullImg").src = V.qr; }
-  else box.textContent = "QR not available. Please pay by bank transfer or ask on WhatsApp.";
   const acct = V.bank && V.bank.acct;
+  const noQr = acct ? "QR not available. Please pay by bank transfer or ask on WhatsApp." : "QR not available. Please ask on WhatsApp how to pay.";
+  if (V.qr) { box.innerHTML = `<img src="${esc(V.qr)}" alt="Payment QR code" onerror="this.parentNode.textContent='${noQr}'">`; $("qrFullImg").src = V.qr; }
+  else box.textContent = noQr;
   $("bankBox").hidden = !acct;
+  $("payBankNote").hidden = !acct;
   if (acct) { $("bankName").textContent = V.bank.name; $("bankHolder").textContent = V.bank.holder; $("bankAcct").textContent = acct; }
 }
 function waMessage(t) {
