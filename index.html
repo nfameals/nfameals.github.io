@@ -319,6 +319,11 @@ pre.rtext{white-space:pre-wrap;background:#fafaf9;border-radius:12px;padding:12p
       <button class="btn btn-sec btn-sm" type="button" data-act="copyAdmin">Copy Admin URL</button>
       <p class="hint">Bookmark this. Don't share it with customers.</p>
     </div>
+    <div class="linkbox">
+      <div class="lbl">Add a partner's phone</div>
+      <p class="hint" style="margin-top:0">Makes a one-time setup link. When your partner opens it, their phone gets the same admin access as this one: shop status, shared orders, everything.</p>
+      <button class="btn btn-main btn-sm" type="button" data-act="makeJoin">📲 Create partner setup link</button>
+    </div>
   </section>
 
   <!-- 3 -->
@@ -375,10 +380,10 @@ pre.rtext{white-space:pre-wrap;background:#fafaf9;border-radius:12px;padding:12p
         <p class="hint">Type the secret from your Google Sheet script once. It stays on this phone only.</p>
       </div>
       <div class="two" style="margin-top:8px">
-        <button class="btn btn-main btn-sm" type="button" data-act="syncNow">🔄 Get new orders</button>
+        <button class="btn btn-main btn-sm" type="button" data-act="syncNow">🔄 Sync orders now</button>
         <button class="btn btn-sec btn-sm" type="button" data-act="saveSecret" id="saveSecretBtn">Save secret</button>
       </div>
-      <p class="hint">Orders customers send from the website appear below as <strong>New (website)</strong>. They are <strong>not counted in sales</strong> until you check the money in GXBank and tap <strong>Verify</strong>.</p>
+      <p class="hint">All orders, statuses and sales are shared with every admin phone through your Google Sheet. Website orders arrive as <strong>New (website)</strong> and are <strong>not counted in sales</strong> until someone checks the money in GXBank and taps <strong>Verify</strong>.</p>
     </div>
     <div class="tiles" id="tiles"></div>
     <p class="hint" id="newNote" hidden></p>
@@ -388,7 +393,7 @@ pre.rtext{white-space:pre-wrap;background:#fafaf9;border-radius:12px;padding:12p
       <button class="btn btn-sec btn-sm" type="button" data-act="import">📥 Import WhatsApp</button>
       <button class="btn btn-main btn-sm" type="button" data-act="logOrder">+ Log Order</button>
       <button class="btn btn-sec btn-sm" type="button" data-act="report">Copy Report</button>
-      <button class="btn btn-danger btn-sm" type="button" data-act="clearOrders" id="clearBtn">Clear</button>
+      <button class="btn btn-danger btn-sm" type="button" data-act="clearOrders" id="clearBtn">Clear all</button>
     </div>
   </section>
 
@@ -417,7 +422,7 @@ const BASE_URL = (function () {
     if (/^https?:$/.test(location.protocol) && /github\.io$/i.test(location.hostname))
       return location.origin + location.pathname.replace(/index\.html$/i, "");
   } catch (e) { /* fall back */ }
-  return "https://farraally-code.github.io/nfameals/";
+  return "https://nfameals.github.io/";
 })();
 const MAX_PAX = 5;
 const PICKUP_PLACE = "Library UMS", PICKUP_TIME = "12:00 PM";
@@ -880,48 +885,120 @@ function sendToInbox(t) {
   } catch (e) { /* ignore: WhatsApp still carries the order */ }
 }
 const getSecret = () => { try { return localStorage.getItem(K_OSEC) || ""; } catch (e) { return ""; } };
-const hiddenRefs = () => { const a = store.get(K_HIDE, []); return Array.isArray(a) ? a : []; };
-function hideRefs(refs) { const s = new Set(hiddenRefs()); refs.forEach(r => r && s.add(r)); store.set(K_HIDE, Array.from(s).slice(-3000)); }
-let INBOX = { state: "", msg: "" }, syncing = false;
+/* Shared orders: the Google Sheet is the one record every admin phone shares. Each phone keeps a small
+   queue of its own changes (new orders, status changes, deletes) until the sheet confirms them, so
+   nothing is lost offline. The sheet stamps the time of every change, never a phone's clock. */
+const K_QUEUE = "nfa.orderqueue.v1", K_MIG = "nfa.migrated.v2";
+function loadQueue() {
+  const q = store.get(K_QUEUE, null);
+  return q && typeof q === "object" ? { creates: Array.isArray(q.creates) ? q.creates : [], changes: Array.isArray(q.changes) ? q.changes : [] } : { creates: [], changes: [] };
+}
+let QUEUE = loadQueue();
+const saveQueue = () => store.set(K_QUEUE, QUEUE);
+const queuedCount = () => QUEUE.creates.length + QUEUE.changes.length;
+const wireOrder = o => ({ ref: o.ref, createdAt: o.createdAt, name: o.name, phone: o.phone, pickup: o.pickup, note: o.note, fee: o.fee, items: o.items, status: o.status, verifiedAt: o.verifiedAt || "" });
+function queueCreate(o) { QUEUE.creates = QUEUE.creates.filter(x => x.ref !== o.ref); QUEUE.creates.push(wireOrder(o)); saveQueue(); kickSync(); }
+function queueChange(o) {
+  const c = QUEUE.creates.find(x => x.ref === o.ref);
+  if (c) { c.status = o.status; c.verifiedAt = o.verifiedAt || ""; }
+  QUEUE.changes = QUEUE.changes.filter(x => x.ref !== o.ref || x.deleted);
+  QUEUE.changes.push({ ref: o.ref, status: o.status, verifiedAt: o.verifiedAt || "" });
+  saveQueue(); kickSync();
+}
+function queueDelete(ref) {
+  QUEUE.creates = QUEUE.creates.filter(x => x.ref !== ref);
+  QUEUE.changes = QUEUE.changes.filter(x => x.ref !== ref);
+  QUEUE.changes.push({ ref, deleted: true });
+  saveQueue(); kickSync();
+}
+/* Build this phone's order list: the sheet's records, with this phone's not-yet-confirmed changes on top. */
+function applyRemote(list) {
+  const pendingDel = new Set(QUEUE.changes.filter(c => c.deleted).map(c => c.ref));
+  const pendingCh = {}; QUEUE.changes.filter(c => !c.deleted).forEach(c => { pendingCh[c.ref] = c; });
+  const out = [];
+  (Array.isArray(list) ? list : []).forEach(r => {
+    if (!r || !r.ref || r.deleted || pendingDel.has(r.ref)) return;
+    const o = cleanOrder(Object.assign({}, r, { id: r.ref }));
+    const p = pendingCh[r.ref];
+    if (p && STATUSES.includes(p.status)) { o.status = p.status; o.verifiedAt = p.verifiedAt || ""; }
+    out.push(o);
+  });
+  QUEUE.creates.forEach(c => { if (!out.some(o => o.ref === c.ref) && !pendingDel.has(c.ref)) out.push(cleanOrder(Object.assign({}, c, { id: c.ref }))); });
+  out.sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
+  return out;
+}
+let INBOX = { state: "", msg: "" }, syncing = false, syncAgain = false, kickTimer;
 function setInbox(state, msg) { INBOX = { state, msg }; renderInbox(); }
 function renderInbox() {
   const el = $("inboxLine"); if (!el) return;
   const url = inboxUrl(), sec = getSecret();
   $("inboxSecretRow").hidden = !!sec; $("saveSecretBtn").hidden = !!sec;
-  if (!url) { el.className = "publine"; el.textContent = "Automatic orders aren't switched on yet (the Google Sheet link isn't added to the website)."; return; }
-  if (!sec) { el.className = "publine bad"; el.textContent = "⚠️ Type your order inbox secret below to start getting website orders here."; return; }
+  if (!url) { el.className = "publine"; el.textContent = "Shared orders aren't switched on yet (the Google Sheet link isn't added to the website)."; return; }
+  if (!sec) { el.className = "publine bad"; el.textContent = "⚠️ Type your order inbox secret below (or open the partner setup link) to share orders with this phone."; return; }
   if (INBOX.state) { el.className = "publine " + INBOX.state; el.textContent = INBOX.msg; return; }
-  const last = store.get(K_SYNC, "");
-  el.className = "publine"; el.textContent = last ? `Last checked ${fmtStamp(last)}.` : "Not checked yet.";
+  const last = store.get(K_SYNC, ""), q = queuedCount();
+  el.className = "publine" + (q ? " busy" : "");
+  el.textContent = (last ? `✅ Shared with all admin phones. Last synced ${fmtStamp(last)}.` : "Not synced yet.") + (q ? ` ${q} change${q > 1 ? "s" : ""} waiting to send.` : "");
+}
+function kickSync() { clearTimeout(kickTimer); kickTimer = setTimeout(() => syncOrders(true), 300); }
+function syncFail(err) {
+  const q = queuedCount(), keep = q ? ` Your ${q} change${q > 1 ? "s are" : " is"} kept on this phone.` : "";
+  if (err === "wrong secret") {
+    setInbox("bad", "❌ The secret doesn't match your Google Sheet script. Type it again below and tap Save secret." + keep);
+    $("inboxSecretRow").hidden = false; $("saveSecretBtn").hidden = false;
+  } else if (err === "old script" || err === "unknown action") {
+    setInbox("bad", "❌ Your Google Sheet script needs the new version (paste the new Code.gs and redeploy)." + keep);
+  } else setInbox("bad", "❌ The order records replied with an error. Try again later." + keep);
+  return false;
 }
 async function syncOrders(quiet) {
   const url = inboxUrl(), sec = getSecret();
-  if (!url || !sec || syncing) { renderInbox(); return false; }
+  if (!url || !sec) { renderInbox(); return false; }
+  if (syncing) { syncAgain = true; return false; }
   syncing = true;
-  if (!quiet) setInbox("busy", "⏳ Getting new orders…");
+  if (!quiet) setInbox("busy", "⏳ Syncing orders…");
   try {
-    const r = await fetch(url, { method: "POST", body: JSON.stringify({ action: "list", secret: sec, since: Date.now() - INBOX_DAYS * 864e5 }) });
-    const j = await r.json();
-    if (!j.ok) {
-      setInbox("bad", j.error === "wrong secret" ? "❌ The secret doesn't match your Google Sheet script. Type it again below and tap Save secret." : "❌ The order inbox replied with an error. Try again later.");
-      if (j.error === "wrong secret") { $("inboxSecretRow").hidden = false; $("saveSecretBtn").hidden = false; $("saveSecretBtn").textContent = "Save secret"; }
-      return false;
+    const call = async body => {
+      const r = await fetch(url, { method: "POST", body: JSON.stringify(Object.assign({ secret: sec, v: 2 }, body)) });
+      return r.json();
+    };
+    let j = await call({ action: "list" });
+    if (!j.ok) return syncFail(j.error);
+    if (j.v !== 2) return syncFail("old script");
+    /* One time only: send orders that were logged on this phone before sharing started. */
+    if (!store.get(K_MIG, false)) {
+      const remote = new Set((j.orders || []).map(o => o.ref));
+      ORDERS.forEach(o => { if (!remote.has(o.ref) && !QUEUE.creates.some(c => c.ref === o.ref)) QUEUE.creates.push(wireOrder(o)); });
+      saveQueue(); store.set(K_MIG, true);
     }
-    const hidden = new Set(hiddenRefs());
-    const fresh = (j.orders || []).filter(o => o && o.ref && !hidden.has(o.ref) && !ORDERS.some(x => x.ref === o.ref))
-      .map(o => cleanOrder(Object.assign({}, o, { status: "New (website)", src: "web" })));
-    if (fresh.length) { ORDERS.push(...fresh); ORDERS.sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt))); afterOrdersChange(); }
+    if (queuedCount()) {
+      const sent = { creates: QUEUE.creates.slice(0, 100), changes: QUEUE.changes.slice(0, 100) };
+      const s = await call({ action: "save", creates: sent.creates, changes: sent.changes });
+      if (!s.ok) return syncFail(s.error);
+      QUEUE.creates = QUEUE.creates.filter(c => !sent.creates.includes(c));
+      QUEUE.changes = QUEUE.changes.filter(c => !sent.changes.includes(c));
+      saveQueue(); j = s;
+    }
+    const before = new Set(ORDERS.map(o => o.ref));
+    ORDERS = applyRemote(j.orders); saveOrders(); renderSales(); renderOrders();
+    const fresh = ORDERS.filter(o => !before.has(o.ref) && o.status === "New (website)").length;
     store.set(K_SYNC, new Date().toISOString());
-    setInbox(fresh.length ? "ok" : "", fresh.length ? `✅ ${fresh.length} new website order${fresh.length > 1 ? "s" : ""} added below.` : "");
-    if (fresh.length) toast(`${fresh.length} new order${fresh.length > 1 ? "s" : ""}!`);
+    setInbox(fresh ? "ok" : "", fresh ? `✅ ${fresh} new website order${fresh > 1 ? "s" : ""} below.` : "");
+    if (fresh) toast(`${fresh} new order${fresh > 1 ? "s" : ""}!`);
     return true;
   } catch (e) {
-    setInbox("bad", "❌ Couldn't reach the order inbox. Check your internet and tap \"Get new orders\".");
+    const q = queuedCount();
+    setInbox("bad", "❌ Couldn't reach the order records. Check your internet." + (q ? ` Your ${q} change${q > 1 ? "s are" : " is"} saved on this phone and will be sent automatically.` : ""));
     return false;
-  } finally { syncing = false; }
+  } finally {
+    syncing = false;
+    if (syncAgain) { syncAgain = false; kickSync(); }
+  }
 }
 
 /* ---------- publishing live status (admin) ---------- */
+/* Every change reads the current status.json from GitHub first and changes only what was tapped,
+   so two admin phones never undo each other's open/closed or sold-out changes. */
 const getKey = () => { try { return localStorage.getItem(K_KEY) || ""; } catch (e) { return ""; } };
 const liveFromS = () => ({ open: S.open, closedMsg: S.closedMsg, soldOut: S.menu.filter(it => !it.available).map(it => it.id), updated: new Date().toISOString() });
 let PUB = { state: "idle", msg: "" }, pubSeq = 0, pubTimer;
@@ -934,50 +1011,84 @@ function renderPubLine() {
   if (PUB.state !== "idle") { el.className = "publine " + PUB.state; el.textContent = PUB.msg; return; }
   const v = LIVE;
   if (!v) { el.className = "publine"; el.textContent = "Checking what customers see…"; return; }
-  const same = v.open === S.open && JSON.stringify(v.soldOut.slice().sort()) === JSON.stringify(liveFromS().soldOut.sort()) && (v.closedMsg || "") === (S.closedMsg || "");
-  el.className = "publine " + (same ? "ok" : "bad");
-  el.textContent = (same ? "✅ Customers see: " : "⚠️ Customers still see: ") + (v.open ? "OPEN" : "CLOSED") +
-    (v.soldOut.length ? ` • sold out: ${v.soldOut.map(id => (S.menu.find(it => it.id === id) || { name: id }).name).join(", ")}` : "") +
-    (same ? "" : ". Tap \"Publish status now\" (changes take about 1 minute to appear).");
+  el.className = "publine ok";
+  el.textContent = "✅ Customers see: " + (v.open ? "OPEN" : "CLOSED") +
+    (v.soldOut.length ? ` • sold out: ${v.soldOut.map(id => (S.menu.find(it => it.id === id) || { name: id }).name).join(", ")}` : "");
 }
 function ghHeaders(key) { return { "Authorization": "Bearer " + key, "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" }; }
 const ghUrl = () => `https://api.github.com/repos/${REPO.owner}/${REPO.name}/contents/${STATUS_URL}`;
 function b64utf8(str) { const bytes = new TextEncoder().encode(str); let s = ""; bytes.forEach(b => { s += String.fromCharCode(b); }); return btoa(s); }
+function utf8b64d(b) { const bin = atob(String(b).replace(/\s/g, "")); return new TextDecoder().decode(Uint8Array.from(bin, c => c.charCodeAt(0))); }
 function ghError(status) {
   return status === 401 ? "the key is wrong or has expired. Create a new key and paste it again."
     : status === 403 || status === 404 ? "the key can't write to this shop. Make sure it's for the nfameals.github.io repository with Contents: Read and write."
     : status === 0 ? "no internet connection. Try again when you have signal."
     : "GitHub returned an error (" + status + "). Try again in a minute.";
 }
-async function publishStatus() {
+async function ghRead(key) {
+  const g = await fetch(ghUrl() + "?t=" + Date.now(), { headers: ghHeaders(key), cache: "no-store" });
+  if (g.status === 404) return { status: 404, sha: undefined, live: null };
+  if (!g.ok) return { status: g.status };
+  const j = await g.json();
+  let live = null; try { live = cleanLive(JSON.parse(utf8b64d(j.content))); } catch (e) { live = null; }
+  return { status: 200, sha: j.sha, live };
+}
+/* Make this phone's buttons match what customers actually see. */
+function applyLiveToS(v) {
+  if (!v) return;
+  S.open = v.open; if (v.closedMsg) S.closedMsg = v.closedMsg;
+  S.menu.forEach(it => { it.available = !v.soldOut.includes(it.id); });
+  saveSettings();
+}
+function renderAfterLive() { if ($("adminView").hidden) return; renderStatus(); renderMenuBuilder(); }
+async function loadLiveAdmin() {
+  const key = getKey();
+  if (key) {
+    try { const r = await ghRead(key); if (r.live) { LIVE = r.live; LIVE_STATE = "ok"; LIVE_AT = Date.now(); } } catch (e) { /* keep last */ }
+  } else await fetchLive();
+  if (LIVE && PUB.state !== "busy") { applyLiveToS(LIVE); renderAfterLive(); }
+  renderPubLine();
+}
+/* change: { open: bool } | { closedMsg: str } | { sold: { id, out: bool } } | { full: true } */
+async function publishStatus(change) {
+  change = change || { full: true };
   const key = getKey(); if (!key) { renderPubLine(); return false; }
   const seq = ++pubSeq;
   setPub("busy", "⏳ Updating your shop for customers…");
-  const body = JSON.stringify(liveFromS(), null, 1) + "\n";
   let lastStatus = 0;
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const g = await fetch(ghUrl() + "?t=" + Date.now(), { headers: ghHeaders(key), cache: "no-store" });
-      lastStatus = g.status;
-      if (!g.ok && g.status !== 404) break;
-      const sha = g.ok ? (await g.json()).sha : undefined;
+      const r = await ghRead(key);
+      lastStatus = r.status;
+      if (r.status !== 200 && r.status !== 404) break;
+      const base = r.live || liveFromS();
+      const next = change.full ? liveFromS() : { open: base.open, closedMsg: base.closedMsg, soldOut: base.soldOut.slice() };
+      if ("open" in change) next.open = !!change.open;
+      if ("closedMsg" in change) next.closedMsg = String(change.closedMsg).slice(0, 140);
+      if (change.sold) { next.soldOut = next.soldOut.filter(id => id !== change.sold.id); if (change.sold.out) next.soldOut.push(change.sold.id); }
+      next.updated = new Date().toISOString();
+      const body = JSON.stringify(next, null, 1) + "\n";
       const p = await fetch(ghUrl(), { method: "PUT", headers: Object.assign({ "Content-Type": "application/json" }, ghHeaders(key)),
-        body: JSON.stringify({ message: `Shop status: ${S.open ? "OPEN" : "CLOSED"}`, content: b64utf8(body), sha }) });
+        body: JSON.stringify({ message: `Shop status: ${next.open ? "OPEN" : "CLOSED"}${next.soldOut.length ? " (sold out: " + next.soldOut.join(", ") + ")" : ""}`, content: b64utf8(body), sha: r.sha }) });
       lastStatus = p.status;
       if (p.ok) {
-        if (seq !== pubSeq) return true;
-        LIVE = cleanLive(JSON.parse(body)); store.set(K_PUB, new Date().toISOString());
-        setPub("ok", `✅ Published: ${S.open ? "OPEN" : "CLOSED"}. Customers will see it within about 1 minute.`);
-        clearTimeout(pubTimer); pubTimer = setTimeout(() => { PUB = { state: "idle", msg: "" }; refreshLive(); }, 90000);
+        if (seq !== pubSeq) return true;   /* a newer tap is in progress; it will show the result */
+        LIVE = cleanLive(next); store.set(K_PUB, next.updated);
+        applyLiveToS(LIVE); renderAfterLive();
+        setPub("ok", `✅ Published: ${next.open ? "OPEN" : "CLOSED"}${next.soldOut.length ? " • sold out: " + next.soldOut.map(id => (S.menu.find(it => it.id === id) || { name: id }).name).join(", ") : ""}. Customers will see it within about 1 minute.`);
+        clearTimeout(pubTimer); pubTimer = setTimeout(() => { PUB = { state: "idle", msg: "" }; loadLiveAdmin(); }, 90000);
         return true;
       }
       if (p.status !== 409 && p.status !== 422) break;
     } catch (e) { lastStatus = 0; }
   }
-  if (seq === pubSeq) setPub("bad", "❌ Not published: " + ghError(lastStatus) + " Customers still see the old status.");
+  if (seq === pubSeq) {
+    if (LIVE) { applyLiveToS(LIVE); renderAfterLive(); }
+    setPub("bad", "❌ Not published: " + ghError(lastStatus) + " Customers still see the old status.");
+  }
   return false;
 }
-function queuePublish() { clearTimeout(publishStatus._t); publishStatus._t = setTimeout(publishStatus, 400); }
+function queuePublish(change) { clearTimeout(queuePublish._t); queuePublish._t = setTimeout(() => publishStatus(change), 400); }
 function renderSetup() {
   setVal("f_biz", S.biz); setVal("f_wa", S.wa); setVal("f_intro", S.intro); setVal("f_fee", S.fee); setVal("f_qr", /^data:/.test(S.qr) ? "" : S.qr);
   $("waPreview").textContent = validWA(S.wa) ? `Saved as ${prettyWA(S.wa)}` : "⚠️ This doesn't look like a Malaysian mobile number.";
@@ -1087,7 +1198,7 @@ function openReceiptModal(o) {
       body.querySelector("#rmCopyLink").onclick = () => copy(url, "Receipt link copied");
       body.querySelector("#rmCopyText").onclick = () => copy(receiptText(o), "Receipt text copied");
       body.querySelector("#rmPreview").onclick = () => { const c = body.querySelector("#rmCard"); c.innerHTML = receiptCardHTML(receiptData(o)); c.hidden = !c.hidden; };
-      body.querySelector("#rmCycle").onclick = () => { cycleStatus(o); afterOrdersChange(); draw(); };
+      body.querySelector("#rmCycle").onclick = () => { const cur = ORDERS.find(x => x.ref === o.ref) || o; cycleStatus(cur); o.status = cur.status; o.verifiedAt = cur.verifiedAt; afterOrdersChange(); queueChange(cur); draw(); };
     });
   };
   draw();
@@ -1139,7 +1250,7 @@ function openImport() {
       const add = body.querySelector("#impAdd");
       if (add) add.onclick = () => {
         const fresh = found.filter(o => !ORDERS.some(x => x.ref === o.ref));
-        ORDERS.push(...fresh); afterOrdersChange(); closeModal(); toast(`${fresh.length} order(s) added`);
+        ORDERS.push(...fresh); afterOrdersChange(); fresh.forEach(queueCreate); closeModal(); toast(`${fresh.length} order(s) added`);
       };
     };
   });
@@ -1184,7 +1295,7 @@ function openLogOrder() {
       ORDERS.push(cleanOrder({ name: body.querySelector("#logName").value.trim(), phone: body.querySelector("#logPhone").value.trim(),
         pickup: body.querySelector("#logPickup").value.trim(), items, fee: S.fee, status: st,
         verifiedAt: st === "Verified Paid" || st === "Collected" ? new Date().toISOString() : "" }));
-      afterOrdersChange(); closeModal(); toast("Order logged");
+      afterOrdersChange(); queueCreate(ORDERS[ORDERS.length - 1]); closeModal(); toast("Order logged");
     };
   });
 }
@@ -1227,7 +1338,7 @@ $("adminView").addEventListener("input", e => {
 $("adminView").addEventListener("change", async e => {
   const el = e.target;
   if (el.dataset.field === "wa") { el.value = S.wa; }
-  if (el.dataset.field === "closedMsg") queuePublish();
+  if (el.dataset.field === "closedMsg") queuePublish({ closedMsg: S.closedMsg });
   if (el.type !== "file" || !el.files || !el.files[0]) return;
   const file = el.files[0];
   try {
@@ -1247,9 +1358,28 @@ $("adminView").addEventListener("click", e => {
   const act = b.dataset.act, i = Number(b.dataset.i), id = b.dataset.id;
   const menuChanged = () => { saveSettings(); flashSaved("savedBadge2"); renderMenuBuilder(); renderLinks(); renderSales(); };
   switch (act) {
-    case "setOpen": S.open = true; saveSettings(); renderStatus(); publishStatus(); break;
-    case "setClosed": S.open = false; saveSettings(); renderStatus(); publishStatus(); break;
+    case "setOpen": S.open = true; saveSettings(); renderStatus(); publishStatus({ open: true }); break;
+    case "setClosed": S.open = false; saveSettings(); renderStatus(); publishStatus({ open: false }); break;
     case "publishNow": publishStatus(); break;
+    case "makeJoin": {
+      const k = getKey(), sec = getSecret();
+      if (!k || !sec) { toast(!k ? "Set up the live status key on this phone first" : "Set up the order inbox secret on this phone first"); break; }
+      confirmTap(b, "📲 Create partner setup link", () => {
+        const link = BASE_URL + "#join=" + b64e({ v: 1, k, s: sec });
+        openModal(`<h2 style="margin-top:0">📲 Partner setup link</h2>
+          <p><strong>This link is like the key to your shop.</strong> Anyone who opens it can open/close the shop, change sold-out meals and see customer orders.</p>
+          <ol class="hint" style="padding-left:18px">
+            <li>Tap <strong>Copy link</strong> and send it to your partner only (for example in your private WhatsApp chat).</li>
+            <li>Your partner opens it on their phone, in Chrome or Safari. That's all: their admin is ready.</li>
+            <li>Then <strong>delete the message</strong> from both phones ("Delete for everyone").</li>
+          </ol>
+          <button class="btn btn-main" type="button" id="joinCopy">Copy link</button>
+          <button class="btn btn-sec btn-sm" type="button" data-close>Close</button>`, body => {
+          body.querySelector("#joinCopy").onclick = () => copy(link, "Setup link copied. Send it to your partner only.");
+        });
+      });
+      break;
+    }
     case "syncNow": syncOrders(false); break;
     case "saveSecret": {
       const s = $("inboxSecret").value.trim().toLowerCase();
@@ -1279,7 +1409,7 @@ $("adminView").addEventListener("click", e => {
     }
     case "up": if (i > 0) { [S.menu[i - 1], S.menu[i]] = [S.menu[i], S.menu[i - 1]]; menuChanged(); } break;
     case "down": if (i < S.menu.length - 1) { [S.menu[i + 1], S.menu[i]] = [S.menu[i], S.menu[i + 1]]; menuChanged(); } break;
-    case "toggleAvail": if (S.menu[i]) { S.menu[i].available = !S.menu[i].available; menuChanged(); publishStatus(); } break;
+    case "toggleAvail": if (S.menu[i]) { const it = S.menu[i]; it.available = !it.available; menuChanged(); publishStatus({ sold: { id: it.id, out: !it.available } }); } break;
     case "delMeal": confirmTap(b, "Delete", () => { S.menu.splice(i, 1); menuChanged(); }); break;
     case "addMeal":
       if (S.menu.length >= 20) { toast("Maximum 20 meals"); break; }
@@ -1290,16 +1420,33 @@ $("adminView").addEventListener("click", e => {
     case "import": openImport(); break;
     case "logOrder": openLogOrder(); break;
     case "report": copy(reportText(), "Report copied"); break;
-    case "clearOrders": if (!ORDERS.length) { toast("Nothing to clear"); break; } confirmTap(b, "Clear", () => { hideRefs(ORDERS.map(o => o.ref)); ORDERS = []; afterOrdersChange(); toast("Order log cleared"); }); break;
-    case "verify": { const o = findOrder(id); if (!o) break; o.status = "Verified Paid"; o.verifiedAt = new Date().toISOString(); afterOrdersChange(); openReceiptModal(o); break; }
+    case "clearOrders": if (!ORDERS.length) { toast("Nothing to clear"); break; } confirmTap(b, "Clear all", () => { const refs = ORDERS.map(o => o.ref); ORDERS = []; afterOrdersChange(); refs.forEach(queueDelete); toast("All orders cleared on every admin phone"); }); break;
+    case "verify": { const o = findOrder(id); if (!o) break; o.status = "Verified Paid"; o.verifiedAt = new Date().toISOString(); afterOrdersChange(); queueChange(o); openReceiptModal(o); break; }
     case "receipt": { const o = findOrder(id); if (o) openReceiptModal(o); break; }
-    case "cycle": { const o = findOrder(id); if (!o) break; cycleStatus(o); afterOrdersChange(); toast("Status: " + o.status); break; }
-    case "delOrder": confirmTap(b, "Delete", () => { const o = findOrder(id); if (o) hideRefs([o.ref]); ORDERS = ORDERS.filter(o => o.id !== id); afterOrdersChange(); }); break;
+    case "cycle": { const o = findOrder(id); if (!o) break; cycleStatus(o); afterOrdersChange(); queueChange(o); toast("Status: " + o.status); break; }
+    case "delOrder": confirmTap(b, "Delete", () => { const o = findOrder(id); ORDERS = ORDERS.filter(x => x.id !== id); afterOrdersChange(); if (o) queueDelete(o.ref); }); break;
   }
 });
 
 /* ================= ROUTER & SYNC ================= */
+/* Partner setup link: #join=<keys>. Read it, remove it from the address bar straight away, save the keys. */
+function handleJoin() {
+  const h = location.hash || "";
+  if (!h.startsWith("#join=")) return "";
+  const d = b64d(h.slice(6));
+  try { history.replaceState(null, "", location.pathname + location.search + "#setup"); } catch (e) { location.hash = "#setup"; }
+  const okKey = d && typeof d.k === "string" && /^(github_pat_|ghp_)[A-Za-z0-9_]{20,}$/.test(d.k);
+  const okSec = d && typeof d.s === "string" && d.s.length >= 12 && d.s.length <= 60;
+  if (!d || d.v !== 1 || !okKey || !okSec) return "This setup link isn't valid. Ask for a new one.";
+  try { localStorage.setItem(K_KEY, d.k); localStorage.setItem(K_OSEC, d.s); } catch (e) { return "Couldn't save on this phone (private browsing?). Open the link in normal Chrome or Safari."; }
+  return "ok";
+}
 function route() {
+  const joined = handleJoin();
+  if (joined) setTimeout(() => {
+    if (joined === "ok") { toast("✅ This phone is now set up as NFA meals admin"); }
+    else toast(joined);
+  }, 400);
   const h = location.hash || "";
   const view = h === "#setup" ? "admin" : h.startsWith("#r=") ? "receipt" : "customer";
   $("customerView").hidden = view !== "customer";
@@ -1307,7 +1454,7 @@ function route() {
   $("receiptView").hidden = view !== "receipt";
   $("qrFull").hidden = true; closeModal();
   if (view !== "customer") $("sticky").hidden = true;
-  if (view === "admin") { document.title = "Seller Admin • " + S.biz; renderAdmin(); refreshLive(); syncOrders(true); }
+  if (view === "admin") { document.title = "Seller Admin • " + S.biz; renderAdmin(); loadLiveAdmin(); syncOrders(true); }
   else if (view === "receipt") { document.title = "Official Receipt • " + S.biz; renderReceiptView(); }
   else renderCustomer();
   window.scrollTo(0, 0);
@@ -1326,11 +1473,11 @@ setInterval(() => {
 setInterval(() => { if (document.visibilityState === "visible" && $("adminView").hidden && $("receiptView").hidden) refreshLive(); }, LIVE_POLL_MS);
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState !== "visible") return;
-  if (Date.now() - LIVE_AT > 15000) refreshLive();
-  if (!$("adminView").hidden) syncOrders(true);
+  if ($("adminView").hidden && Date.now() - LIVE_AT > 15000) refreshLive();
+  if (!$("adminView").hidden) { syncOrders(true); loadLiveAdmin(); }
 });
 /* Admin: check the order inbox every minute while open. */
-setInterval(() => { if (document.visibilityState === "visible" && !$("adminView").hidden) syncOrders(true); }, 60000);
+setInterval(() => { if (document.visibilityState === "visible" && !$("adminView").hidden) { syncOrders(true); if (PUB.state !== "busy") loadLiveAdmin(); } }, 60000);
 
 route();
 if ($("adminView").hidden) refreshLive();
