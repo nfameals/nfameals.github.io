@@ -112,6 +112,7 @@ code.url{display:block;margin-top:6px;padding:10px;background:#fafaf9;border-rad
 .pill.av,.pill.st-verified{background:#dcfce7;color:var(--ok)}
 .pill.so,.pill.st-cancelled{background:#fee2e2;color:var(--warn)}
 .pill.st-submitted{background:#fef3c7;color:#92400e}
+.pill.st-new{background:#e0f2fe;color:#075985}
 .pill.st-collected{background:#dbeafe;color:var(--blue)}
 .tiles{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 .tile{background:#fafaf9;border:1px solid #e7e5e4;border-radius:12px;padding:12px}
@@ -154,6 +155,7 @@ pre.rtext{white-space:pre-wrap;background:#fafaf9;border-radius:12px;padding:12p
   "open": true,
   "closedMsg": "Orders are paused for now. Please check back soon.",
   "qr": "qr.jpg",
+  "ordersUrl": "",
   "bank": { "name": "GXBank", "holder": "Nur Farahain Binti Alifuddin", "acct": "" },
   "menu": [
     { "id": "basic", "name": "Basic", "price": 10, "desc": "Nasi putih, ayam goreng, sayur campur", "photo": "basic.jpg", "available": true },
@@ -364,7 +366,22 @@ pre.rtext{white-space:pre-wrap;background:#fafaf9;border-radius:12px;padding:12p
   <!-- 5 -->
   <section class="card">
     <h2>5. Sales &amp; meal breakdown</h2>
+    <div class="linkbox" id="inboxBox">
+      <div class="lbl">Website orders (automatic)</div>
+      <div id="inboxLine" class="publine" role="status"></div>
+      <div id="inboxSecretRow">
+        <label for="inboxSecret">Order inbox secret</label>
+        <input id="inboxSecret" type="password" autocomplete="off" spellcheck="false" placeholder="nfa-xxxx-xxxx-xxxx">
+        <p class="hint">Type the secret from your Google Sheet script once. It stays on this phone only.</p>
+      </div>
+      <div class="two" style="margin-top:8px">
+        <button class="btn btn-main btn-sm" type="button" data-act="syncNow">🔄 Get new orders</button>
+        <button class="btn btn-sec btn-sm" type="button" data-act="saveSecret" id="saveSecretBtn">Save secret</button>
+      </div>
+      <p class="hint">Orders customers send from the website appear below as <strong>New (website)</strong>. They are <strong>not counted in sales</strong> until you check the money in GXBank and tap <strong>Verify</strong>.</p>
+    </div>
     <div class="tiles" id="tiles"></div>
+    <p class="hint" id="newNote" hidden></p>
     <h3>Meals purchased breakdown</h3>
     <div id="breakdown"></div>
     <div class="grid4">
@@ -421,7 +438,11 @@ const REPO = (function () {
 })();
 const STATUS_URL = "status.json";
 const LIVE_POLL_MS = 60000;
-const STATUSES = ["Payment Submitted", "Verified Paid", "Collected", "Cancelled"];
+const STATUSES = ["New (website)", "Payment Submitted", "Verified Paid", "Collected", "Cancelled"];
+const NOT_COUNTED = ["New (website)", "Cancelled"];
+/* Order inbox (Google Sheet). The read secret lives in its own key, never inside settings. */
+const K_OSEC = "nfa.ordersecret.v1", K_HIDE = "nfa.hiddenrefs.v1", K_SYNC = "nfa.lastsync.v1";
+const INBOX_DAYS = 21;
 const DEFAULT_MENU = [
   { id: "basic", name: "Basic", price: 10, desc: "Nasi putih, ayam goreng, sayur campur", photo: "basic.jpg", available: true },
   { id: "standard", name: "Standard", price: 12.5, desc: "Nasi putih, kari ayam, sayur campur", photo: "standard.jpg", available: true, badge: "Most popular" },
@@ -531,7 +552,7 @@ function cleanOrder(o) {
     id: String(o.id || uid()), ref: String(o.ref || newRef()), name: String(o.name || "").slice(0, 60), phone: String(o.phone || "").slice(0, 20),
     items, fee: num(o.fee), pickup: String(o.pickup || ""), note: String(o.note || "").slice(0, 200),
     status: STATUSES.includes(o.status) ? o.status : "Payment Submitted",
-    createdAt: o.createdAt || new Date().toISOString(), verifiedAt: o.verifiedAt || ""
+    createdAt: o.createdAt || new Date().toISOString(), verifiedAt: o.verifiedAt || "", src: o.src === "web" ? "web" : ""
   };
 }
 function loadOrders() { const a = store.get(K_ORD, []); return Array.isArray(a) ? a.map(cleanOrder) : []; }
@@ -768,6 +789,7 @@ $("waBtn").addEventListener("click", async e => {
     $("packs").scrollIntoView({ behavior: "smooth", block: "start" });
     return;
   }
+  sendToInbox(t);   /* fire-and-forget: never delays or blocks WhatsApp */
   const waUrl = "https://wa.me/" + V.wa + "?text=" + encodeURIComponent(waMessage(t));
   let w = null; try { w = window.open(waUrl, "_blank", "noopener"); } catch (err) { w = null; }
   if (!w) setTimeout(() => { window.location.href = waUrl; }, 120);
@@ -825,7 +847,7 @@ function setVal(id, v) { const el = $(id); if (el && document.activeElement !== 
 
 function renderAdmin() {
   $("aBiz").textContent = S.biz;
-  renderStatus(); renderLinks(); renderSetup(); renderMenuBuilder(); renderSales(); renderOrders();
+  renderStatus(); renderLinks(); renderSetup(); renderMenuBuilder(); renderSales(); renderOrders(); renderInbox();
 }
 function renderStatus() {
   const sl = $("statusLine");
@@ -841,6 +863,62 @@ function renderLinks() {
   $("lnkClean").textContent = BASE_URL;
   $("lnkAdmin").textContent = BASE_URL + "#setup";
   $("waShort").href = "https://wa.me/?text=" + encodeURIComponent(`Order lunch from ${S.biz} (Library UMS, 12:00 PM pickup): ${BASE_URL}`);
+}
+
+/* ---------- order inbox (Google Sheet) ---------- */
+function inboxUrl() {
+  const u = String(fileDefaults().ordersUrl || "");
+  return /^https:\/\/script\.google\.com\/macros\/s\/[\w-]+\/exec$/.test(u) ? u : "";
+}
+function sendToInbox(t) {
+  const url = inboxUrl(); if (!url) return;
+  const order = { ref: CUR_REF, name: $("cName").value.trim(), phone: $("cPhone").value.trim(), note: $("cNote").value.trim(),
+    pickup: `${PICKUP_PLACE}, ${MODE.label}`, fee: V.fee,
+    items: V.menu.filter(it => it.available && qty[it.id] > 0).map(it => ({ name: it.name, qty: qty[it.id], price: it.price })) };
+  try {
+    fetch(url, { method: "POST", mode: "no-cors", keepalive: true, body: JSON.stringify({ action: "order", order }) }).catch(() => {});
+  } catch (e) { /* ignore: WhatsApp still carries the order */ }
+}
+const getSecret = () => { try { return localStorage.getItem(K_OSEC) || ""; } catch (e) { return ""; } };
+const hiddenRefs = () => { const a = store.get(K_HIDE, []); return Array.isArray(a) ? a : []; };
+function hideRefs(refs) { const s = new Set(hiddenRefs()); refs.forEach(r => r && s.add(r)); store.set(K_HIDE, Array.from(s).slice(-3000)); }
+let INBOX = { state: "", msg: "" }, syncing = false;
+function setInbox(state, msg) { INBOX = { state, msg }; renderInbox(); }
+function renderInbox() {
+  const el = $("inboxLine"); if (!el) return;
+  const url = inboxUrl(), sec = getSecret();
+  $("inboxSecretRow").hidden = !!sec; $("saveSecretBtn").hidden = !!sec;
+  if (!url) { el.className = "publine"; el.textContent = "Automatic orders aren't switched on yet (the Google Sheet link isn't added to the website)."; return; }
+  if (!sec) { el.className = "publine bad"; el.textContent = "⚠️ Type your order inbox secret below to start getting website orders here."; return; }
+  if (INBOX.state) { el.className = "publine " + INBOX.state; el.textContent = INBOX.msg; return; }
+  const last = store.get(K_SYNC, "");
+  el.className = "publine"; el.textContent = last ? `Last checked ${fmtStamp(last)}.` : "Not checked yet.";
+}
+async function syncOrders(quiet) {
+  const url = inboxUrl(), sec = getSecret();
+  if (!url || !sec || syncing) { renderInbox(); return false; }
+  syncing = true;
+  if (!quiet) setInbox("busy", "⏳ Getting new orders…");
+  try {
+    const r = await fetch(url, { method: "POST", body: JSON.stringify({ action: "list", secret: sec, since: Date.now() - INBOX_DAYS * 864e5 }) });
+    const j = await r.json();
+    if (!j.ok) {
+      setInbox("bad", j.error === "wrong secret" ? "❌ The secret doesn't match your Google Sheet script. Type it again below and tap Save secret." : "❌ The order inbox replied with an error. Try again later.");
+      if (j.error === "wrong secret") { $("inboxSecretRow").hidden = false; $("saveSecretBtn").hidden = false; $("saveSecretBtn").textContent = "Save secret"; }
+      return false;
+    }
+    const hidden = new Set(hiddenRefs());
+    const fresh = (j.orders || []).filter(o => o && o.ref && !hidden.has(o.ref) && !ORDERS.some(x => x.ref === o.ref))
+      .map(o => cleanOrder(Object.assign({}, o, { status: "New (website)", src: "web" })));
+    if (fresh.length) { ORDERS.push(...fresh); ORDERS.sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt))); afterOrdersChange(); }
+    store.set(K_SYNC, new Date().toISOString());
+    setInbox(fresh.length ? "ok" : "", fresh.length ? `✅ ${fresh.length} new website order${fresh.length > 1 ? "s" : ""} added below.` : "");
+    if (fresh.length) toast(`${fresh.length} new order${fresh.length > 1 ? "s" : ""}!`);
+    return true;
+  } catch (e) {
+    setInbox("bad", "❌ Couldn't reach the order inbox. Check your internet and tap \"Get new orders\".");
+    return false;
+  } finally { syncing = false; }
 }
 
 /* ---------- publishing live status (admin) ---------- */
@@ -930,7 +1008,7 @@ function renderMenuBuilder() {
     </div>`).join("") : `<p class="hint">No meals yet. Add one, or reset to the default 3.</p>`;
 }
 function stats() {
-  const act = ORDERS.filter(o => o.status !== "Cancelled");
+  const act = ORDERS.filter(o => !NOT_COUNTED.includes(o.status));
   const paid = ORDERS.filter(o => o.status === "Verified Paid" || o.status === "Collected").length;
   let pax = 0, food = 0, fees = 0; const by = {};
   act.forEach(o => {
@@ -953,10 +1031,13 @@ function renderSales() {
     const d = s.by[k] || { pax: 0, rm: 0 }; const pct = s.pax ? Math.round(d.pax / s.pax * 100) : 0;
     return `<div class="bd"><div class="row"><strong>${esc(k)}</strong><span>${d.pax} pax • ${pct}% • ${money(d.rm)}</span></div><div class="bar"><i style="width:${pct}%"></i></div></div>`;
   }).join("") || `<p class="hint">No meals on the menu.</p>`;
+  const nNew = ORDERS.filter(o => o.status === "New (website)");
+  $("newNote").hidden = !nNew.length;
+  $("newNote").textContent = `${nNew.length} new website order${nNew.length > 1 ? "s" : ""} (${money(nNew.reduce((a, o) => a + orderTotal(o), 0))}) waiting for you to check payment. Not counted above until verified.`;
 }
-const stClass = s => ({ "Payment Submitted": "st-submitted", "Verified Paid": "st-verified", "Collected": "st-collected", "Cancelled": "st-cancelled" }[s] || "");
+const stClass = s => ({ "New (website)": "st-new", "Payment Submitted": "st-submitted", "Verified Paid": "st-verified", "Collected": "st-collected", "Cancelled": "st-cancelled" }[s] || "");
 function renderOrders() {
-  if (!ORDERS.length) { $("orderList").innerHTML = `<p class="hint" style="margin-top:0">No orders logged yet. Use 📥 Import WhatsApp or + Log Order.</p>`; return; }
+  if (!ORDERS.length) { $("orderList").innerHTML = `<p class="hint" style="margin-top:0">No orders yet. Website orders appear here automatically; you can also use 📥 Import WhatsApp or + Log Order.</p>`; return; }
   $("orderList").innerHTML = ORDERS.slice().reverse().map(o => `
     <div class="ocard${o.status === "Cancelled" ? " cx" : ""}">
       <div class="ohead"><strong>${esc(o.ref)}</strong><span class="pill ${stClass(o.status)}">${esc(o.status)}</span></div>
@@ -965,7 +1046,7 @@ function renderOrders() {
       <div><strong>${money(orderTotal(o))}</strong>${o.pickup ? ` • ${esc(o.pickup)}` : ""}</div>
       ${o.note ? `<div class="hint" style="margin:2px 0 0">Note: ${esc(o.note)}</div>` : ""}
       <div class="hint" style="margin:2px 0 0">Logged ${esc(fmtStamp(o.createdAt))}${o.verifiedAt ? ` • Verified ${esc(fmtStamp(o.verifiedAt))}` : ""}</div>
-      ${o.status === "Payment Submitted"
+      ${o.status === "Payment Submitted" || o.status === "New (website)"
         ? `<button class="btn btn-ok btn-sm" type="button" data-act="verify" data-id="${esc(o.id)}">✓ Verify Payment &amp; Issue Official Receipt</button>`
         : o.status !== "Cancelled" ? `<button class="btn btn-sec btn-sm" type="button" data-act="receipt" data-id="${esc(o.id)}">🧾 Official receipt</button>` : ""}
       <div class="two">
@@ -1169,6 +1250,15 @@ $("adminView").addEventListener("click", e => {
     case "setOpen": S.open = true; saveSettings(); renderStatus(); publishStatus(); break;
     case "setClosed": S.open = false; saveSettings(); renderStatus(); publishStatus(); break;
     case "publishNow": publishStatus(); break;
+    case "syncNow": syncOrders(false); break;
+    case "saveSecret": {
+      const s = $("inboxSecret").value.trim().toLowerCase();
+      if (s.length < 12) { toast("Type the full secret, like nfa-xxxx-xxxx-xxxx"); break; }
+      try { localStorage.setItem(K_OSEC, s); } catch (err) { toast("Couldn't save on this phone"); break; }
+      $("inboxSecret").value = ""; INBOX = { state: "", msg: "" };
+      syncOrders(false).then(ok => { if (ok) toast("Order inbox connected!"); });
+      break;
+    }
     case "saveKey": {
       const k = $("ghKey").value.trim();
       if (!/^(github_pat_|ghp_)[A-Za-z0-9_]{20,}$/.test(k)) { toast("That doesn't look like a GitHub key (it starts with github_pat_)"); break; }
@@ -1200,11 +1290,11 @@ $("adminView").addEventListener("click", e => {
     case "import": openImport(); break;
     case "logOrder": openLogOrder(); break;
     case "report": copy(reportText(), "Report copied"); break;
-    case "clearOrders": if (!ORDERS.length) { toast("Nothing to clear"); break; } confirmTap(b, "Clear", () => { ORDERS = []; afterOrdersChange(); toast("Order log cleared"); }); break;
+    case "clearOrders": if (!ORDERS.length) { toast("Nothing to clear"); break; } confirmTap(b, "Clear", () => { hideRefs(ORDERS.map(o => o.ref)); ORDERS = []; afterOrdersChange(); toast("Order log cleared"); }); break;
     case "verify": { const o = findOrder(id); if (!o) break; o.status = "Verified Paid"; o.verifiedAt = new Date().toISOString(); afterOrdersChange(); openReceiptModal(o); break; }
     case "receipt": { const o = findOrder(id); if (o) openReceiptModal(o); break; }
     case "cycle": { const o = findOrder(id); if (!o) break; cycleStatus(o); afterOrdersChange(); toast("Status: " + o.status); break; }
-    case "delOrder": confirmTap(b, "Delete", () => { ORDERS = ORDERS.filter(o => o.id !== id); afterOrdersChange(); }); break;
+    case "delOrder": confirmTap(b, "Delete", () => { const o = findOrder(id); if (o) hideRefs([o.ref]); ORDERS = ORDERS.filter(o => o.id !== id); afterOrdersChange(); }); break;
   }
 });
 
@@ -1217,7 +1307,7 @@ function route() {
   $("receiptView").hidden = view !== "receipt";
   $("qrFull").hidden = true; closeModal();
   if (view !== "customer") $("sticky").hidden = true;
-  if (view === "admin") { document.title = "Seller Admin • " + S.biz; renderAdmin(); refreshLive(); }
+  if (view === "admin") { document.title = "Seller Admin • " + S.biz; renderAdmin(); refreshLive(); syncOrders(true); }
   else if (view === "receipt") { document.title = "Official Receipt • " + S.biz; renderReceiptView(); }
   else renderCustomer();
   window.scrollTo(0, 0);
@@ -1234,7 +1324,13 @@ setInterval(() => {
 
 /* Customers: re-check the live status every minute while the page is visible, and whenever they come back to it. */
 setInterval(() => { if (document.visibilityState === "visible" && $("adminView").hidden && $("receiptView").hidden) refreshLive(); }, LIVE_POLL_MS);
-document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && Date.now() - LIVE_AT > 15000) refreshLive(); });
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") return;
+  if (Date.now() - LIVE_AT > 15000) refreshLive();
+  if (!$("adminView").hidden) syncOrders(true);
+});
+/* Admin: check the order inbox every minute while open. */
+setInterval(() => { if (document.visibilityState === "visible" && !$("adminView").hidden) syncOrders(true); }, 60000);
 
 route();
 if ($("adminView").hidden) refreshLive();
